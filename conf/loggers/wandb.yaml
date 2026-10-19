@@ -1,0 +1,10 @@
+wandb:
+  _target_: lightning.pytorch.loggers.wandb.WandbLogger
+  name: null
+  save_dir: ${paths.output_dir}
+  log_model: false
+  mode: disabled
+  project: VampPrior-Unleashed
+  group: ${experiment_name}
+  job_type: fit
+  tags: []

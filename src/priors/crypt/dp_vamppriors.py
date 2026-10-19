@@ -1,0 +1,160 @@
+from typing import Literal
+
+import torch
+from torch import Tensor
+from torch.distributions import (
+    Beta,
+    Categorical,
+    Distribution,
+    Independent,
+    MixtureSameFamily,
+    kl_divergence,
+)
+
+from .vamppriors import VampPrior, VampPriorUnleashed
+
+
+class DirichletProcessVampPrior(VampPrior):
+
+    def __init__(
+        self,
+        *,
+        concentration: float,
+        num_data: int,
+        posterior_init: Literal["prior", "uniform"] = "prior",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.concentration = concentration
+        self.num_data = num_data
+
+        # TODO: remove this hack
+        if concentration == 11.0:
+            posterior_init = "uniform"
+
+        log_gamma_init = torch.zeros(self.k, 2)
+        if posterior_init == "prior":
+            log_gamma_init[:, 1] = (torch.ones(self.k) * concentration).log()
+        elif posterior_init == "uniform":
+            log_gamma_init[:-1, 1] = torch.arange(self.k - 1, 0, -1).float().log()
+
+        self.log_gamma = torch.nn.Parameter(log_gamma_init)
+
+    @property
+    def has_global_latent_variables(self) -> bool:
+        return True
+
+    @property
+    def pz(self) -> Distribution:
+        logits = self.log_pi(*self.log_e_v_and_log_e_vm1())
+        return MixtureSameFamily(Categorical(logits=logits), self.pz_c)
+
+    @property
+    def gamma(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.log_gamma.exp()[:, 0], self.log_gamma.exp()[:, 1]
+
+    @property
+    def pv(self) -> Distribution:
+        ones = torch.ones(self.k - 1, device=self.log_gamma.device)
+        return Independent(Beta(ones, self.concentration * ones), 1)
+
+    @property
+    def qv(self) -> Distribution:
+        gamma_1, gamma_2 = self.gamma
+        return Independent(Beta(gamma_1[:-1], gamma_2[:-1]), 1)
+
+    def e_log_v_and_e_log_vm1(self) -> tuple[torch.Tensor, torch.Tensor]:
+        gamma_1, gamma_2 = self.gamma
+        e_log_v = (torch.digamma(gamma_1) - torch.digamma(gamma_1 + gamma_2))[:-1]
+        e_log_v = torch.concat([e_log_v, torch.as_tensor([0]).to(e_log_v.device)])
+        e_log_vm1 = (torch.digamma(gamma_2) - torch.digamma(gamma_1 + gamma_2))[:-1]
+        e_log_vm1 = torch.concat(
+            [e_log_vm1, torch.as_tensor([-torch.inf]).to(e_log_vm1.device)]
+        )
+        return e_log_v, e_log_vm1
+
+    def log_e_v_and_log_e_vm1(self) -> tuple[torch.Tensor, torch.Tensor]:
+        gamma_1, gamma_2 = self.gamma
+        log_gamma = (gamma_1 + gamma_2).log()
+        log_e_v = (gamma_1.log() - log_gamma)[:-1]
+        log_e_v = torch.concat([log_e_v, torch.zeros_like(log_e_v[:1])])
+        log_e_vm1 = (gamma_2.log() - log_gamma)[:-1]
+        log_e_vm1 = torch.concat(
+            [log_e_vm1, torch.full_like(log_e_vm1[:1], -torch.inf)]
+        )
+        return log_e_v, log_e_vm1
+
+    def log_pi(self, log_v: Tensor, log_vm1: Tensor) -> Tensor:
+        return log_v + torch.concat(
+            [torch.zeros_like(log_vm1)[:1], torch.cumsum(log_vm1, dim=0)[:-1]]
+        )
+
+    def qc(self, log_pz_c: Tensor, e_log_v: Tensor, e_log_vm1: Tensor) -> Categorical:
+        return Categorical(logits=log_pz_c + self.log_pi(e_log_v, e_log_vm1))
+
+    def dkl_v(self) -> torch.Tensor:
+        gamma_1, gamma_2 = self.gamma
+        qv = Beta(gamma_1, gamma_2)
+        pv = Beta(1, self.concentration)
+        return kl_divergence(qv, pv)[:-1].sum()
+
+    def dkl_c(self, qc_z: Categorical, log_v: Tensor, log_vm1: Tensor) -> torch.Tensor:
+        qc_gtj_z = torch.fliplr(torch.cumsum(torch.fliplr(qc_z.probs), dim=1)[:, :-1])
+        qc_gtj_z = torch.concat([qc_gtj_z, torch.zeros_like(qc_gtj_z)[:, :1]], dim=1)
+        dkl_c = (
+            -qc_z.entropy()
+            - (qc_z.probs * log_v).sum(dim=1)
+            - (qc_gtj_z[:, :-1] * log_vm1[:-1]).sum(dim=1)
+        )
+        return dkl_c
+
+    def dkl_z(self, qz_x: Distribution, qc_z: Categorical, log_pz_c: Tensor) -> Tensor:
+        dkl_z = -qz_x.entropy() - (qc_z.probs * log_pz_c).sum(dim=-1)
+        return dkl_z
+
+    def dkl(self, qz_x: Distribution, z_sample: Tensor) -> Tensor:
+        log_pz_c = self.log_pz_c(z_sample)
+        e_log_v, e_log_vm1 = self.e_log_v_and_e_log_vm1()
+        qc_z = self.qc(log_pz_c, e_log_v, e_log_vm1)
+        local_kl = self.dkl_z(qz_x, qc_z, log_pz_c) + self.dkl_c(
+            qc_z, e_log_v, e_log_vm1
+        )
+        global_kl = self.dkl_v()
+        return local_kl.mean() + global_kl / self.num_data
+
+    def cluster_responsibilities(self, z: Tensor) -> Categorical:
+        log_pz_c = self.log_pz_c(z)
+        e_log_v, e_log_vm1 = self.e_log_v_and_e_log_vm1()
+        qc_z = self.qc(log_pz_c, e_log_v, e_log_vm1)
+        return qc_z
+
+    def global_importance_sampling(self, k: int) -> tuple[dict[str, Tensor], Tensor]:
+        v = self.qv.sample((k,))
+        log_pdq = self.pv.log_prob(v) - self.qv.log_prob(v)
+        return {"v": v}, log_pdq
+
+    def log_pz(
+        self, z: Tensor, global_samples: dict[str, Tensor] | None = None
+    ) -> Tensor:
+        if global_samples is None:
+            return self.pz.log_prob(z)
+        if "v" not in global_samples:
+            raise ValueError("globals must contain 'v'")
+        v = global_samples["v"].unsqueeze(1).unsqueeze(1)
+        log_v = torch.cat([v.log(), torch.zeros_like(v[..., :1])], dim=-1)
+        log_1mv = torch.log1p(-v)
+        prefix = torch.cat(
+            [torch.zeros_like(log_1mv[..., :1]), log_1mv.cumsum(dim=-1)], dim=-1
+        )
+        pz_v = MixtureSameFamily(Categorical(logits=log_v + prefix), self.pz_c)
+        return pz_v.log_prob(z)
+
+
+class DirichletProcessVampPriorUnleashed(DirichletProcessVampPrior, VampPriorUnleashed):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def log_pz_c(self, z: Tensor) -> Tensor:
+        return VampPriorUnleashed.log_pz_c(self, z)

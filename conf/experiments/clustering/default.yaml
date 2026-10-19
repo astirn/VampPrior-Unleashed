@@ -1,0 +1,69 @@
+# @package _global_
+
+defaults:
+  - /callbacks@callbacks: default
+  - /loggers@loggers: default
+  - /priors@model.prior_params: crypt/dp_vampprior_unleashed
+  - /hydra
+  - /paths
+  - /trainer@trainer: step_based
+  - _self_
+
+experiment_name: Clustering/${data.dataset}
+seed: 1
+
+data:
+  _target_: src.data.ClusteringDataModule
+  dataset: ???
+  batch_size:
+    train: 512
+    val: 512
+    test: 8
+    predict: 512
+  num_workers: 8
+  pin_memory: true
+  root: datasets/clustering
+
+model:
+  _target_: src.models.VariationalAutoencoder
+  _recursive_: false
+
+  dim_z: ???
+
+  decoder_params:
+    _target_: src.experiments.clustering.Decoder
+
+  encoder_params:
+    _target_: src.experiments.clustering.Encoder
+
+  prior_params:
+    dim_z: ${model.dim_z}
+
+  u_initial_strategy: random
+  kl_warmup_steps: 0
+
+metrics:
+  validation_metrics:
+    - _target_: src.metrics.ClusteringMetrics
+      label_key: c
+
+  test_metrics:
+    - _target_: src.metrics.ModelMetrics
+      k: 5000
+
+  full_metrics:
+    - _target_: src.metrics.ClusteringMetrics
+      label_key: c
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-3
+  weight_decay: 0.0
+
+model_wrapper:
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+trainer:
+  max_steps: 20000
+  val_check_interval: 100

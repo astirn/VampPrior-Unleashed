@@ -1,0 +1,13 @@
+# Directories
+.venv
+.vscode
+assets
+datasets
+logs
+
+# File extensions
+*.pyc
+
+# Files
+.DS_Store
+.env

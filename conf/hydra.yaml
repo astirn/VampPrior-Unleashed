@@ -1,0 +1,14 @@
+# @package hydra
+
+defaults:
+  - override hydra/launcher@launcher: subprocess
+
+launcher:
+  n_jobs: 1
+
+run:
+  dir: ${paths.log_dir}/single/${now:%Y-%m-%d_%H-%M-%S}
+
+sweep:
+  dir: ${paths.log_dir}/multirun/${now:%Y-%m-%d_%H-%M-%S}
+  subdir: ${hydra.job.num}

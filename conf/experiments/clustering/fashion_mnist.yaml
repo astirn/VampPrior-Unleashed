@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - default
+  - _self_
+
+data:
+  dataset: FashionMNIST
+
+model:
+  dim_z: 15
+
+  prior_params:
+    concentration: 1.0
